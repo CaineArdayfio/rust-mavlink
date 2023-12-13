@@ -55,7 +55,10 @@ heapless = { version = "0.8", default-features = false }
     "uavionix",
     "avssuas",
     "cubepilot",
+    "ares"
 ]
+
+"ares" = []
 "ardupilotmega" = ["common", "icarous", "uavionix"]
 "asluav" = ["common"]
 "avssuas" = ["common"]
@@ -74,6 +77,7 @@ heapless = { version = "0.8", default-features = false }
 "cubepilot" = ["common"]
 
 "all-dialects" = [
+    "ares",
     "ardupilotmega",
     "asluav",
     "avssuas",
