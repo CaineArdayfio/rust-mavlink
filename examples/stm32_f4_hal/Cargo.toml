@@ -14,7 +14,8 @@ lto = true      # Performs "fat" LTO which attempts to perform optimizations acr
 cortex-m = "0.7" # Low level access to Cortex-M processors
 cortex-m-rt = "0.7" # Startup code and minimal runtime for Cortex-M microcontrollers
 panic-halt = "0.2" # Panic handler
-stm32f3xx-hal = { version = "0.9", features = ["stm32f303xe"] } # HAL for stm32f303xe
+stm32f4xx-hal = { version = "0.18.0", features = ["stm32f446"] } # HAL for stm32f303xe
+fugit = "0.3.7"
 
 [dependencies.mavlink] # MAVLink library (wait for 0.9.0 version)
 path = "../../"

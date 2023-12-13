@@ -22,13 +22,15 @@
 #![deny(clippy::all)]
 #![warn(clippy::use_self)]
 
-use core::result::Result;
+use core::{result::Result, panic};
 
 #[cfg(feature = "std")]
 use std::io::{Read, Write};
 
 #[cfg(feature = "std")]
 use byteorder::ReadBytesExt;
+use defmt::info;
+use embassy_stm32::peripherals::USART2;
 
 #[cfg(feature = "std")]
 mod connection;
@@ -56,7 +58,7 @@ pub mod error;
 #[cfg(feature = "embedded")]
 mod embedded;
 #[cfg(feature = "embedded")]
-use embedded::{Read, Write};
+use embedded::{Read, Write, ReadEmbassyAsync, WriteEmbassyAsync};
 
 pub const MAX_FRAME_SIZE: usize = 280;
 
@@ -385,6 +387,206 @@ pub fn read_v1_raw_message<R: Read>(
     Ok(message)
 }
 
+/// Return a raw buffer with the mavlink message
+/// V1 maximum size is 263 bytes: `<https://mavlink.io/en/guide/serialization.html>`
+pub async fn read_v1_raw_message_async<R: ReadEmbassyAsync>(
+    reader: &mut R,
+) -> Result<MAVLinkV1MessageRaw, error::MessageReadError> {
+    loop {
+        let res = reader.read_u8().await;
+        match res {
+            Ok(v) => {
+                if v == MAV_STX {
+                    break;
+                }
+            },
+            Err(e) => {
+                info!("error reading byte");
+                return Err(error::MessageReadError::Io);
+            }
+        }
+    }
+
+    let mut message = MAVLinkV1MessageRaw::new();
+
+    message.0[0] = MAV_STX;
+    // message.mut_header() does MAVLinkV1MessageRaw::new().0 and returns &mut [u8]
+
+    reader.read_exact(message.mut_header()).await;
+    reader.read_exact(message.mut_payload_and_checksum()).await;
+
+    Ok(message)
+}
+
+use crate::error::*;
+use embassy_stm32::usart::{Config, UartTx, UartRx};
+use embassy_stm32::{bind_interrupts, peripherals, usart};
+
+/// Read a MAVLink v1  message from a Read stream.
+pub async fn read_v1_msg_shitty<M: Message>(
+    r: &mut UartRx<'static, peripherals::UART7, peripherals::DMA1_CH4>,
+) -> Result<(MavHeader, M), error::MessageReadError> {
+    loop {
+        let mut msg = [0u8; 300];
+        let n = r.read_until_idle(&mut msg).await;
+        match n {
+            Ok(v) => {
+                let new_n = n.unwrap();
+                if v == 0 {
+                    info!("no bytes read");
+                    continue;
+                } else {
+                    // info!("--------------------------------------------------------------------");
+                    // info!("Size: {}", new_n);
+                    // info!("{:?}", msg);
+                    if msg[0] == MAV_STX {
+                        let mut MavMess = MAVLinkV1MessageRaw::new();
+                        
+                        MavMess.0[0] = MAV_STX;
+                        // fill header with bytes 1...len(header)
+                        MavMess.mut_header().copy_from_slice(&msg[1..=MAVLinkV1MessageRaw::HEADER_SIZE]);
+
+                        let payload_length = MavMess.payload_length() as usize;
+                        // fill payload with bytes len(header)+1...len(header)+1+payload_length
+                        MavMess.mut_payload_and_checksum().copy_from_slice(&msg[(1 + MAVLinkV1MessageRaw::HEADER_SIZE)..(1 + MAVLinkV1MessageRaw::HEADER_SIZE + payload_length + 2)]);
+
+                        // info!("MavMess: {:?}", MavMess.0);
+                        if !MavMess.has_valid_crc::<M>() {
+                            info!("Invalid crc");
+                            continue;
+                        }
+                        return M::parse(
+                            MavlinkVersion::V1,
+                            u32::from(MavMess.message_id()),
+                            MavMess.payload(),
+                        )
+                        .map(|msg| {
+                            (
+                                MavHeader {
+                                    sequence: MavMess.sequence(),
+                                    system_id: MavMess.system_id(),
+                                    component_id: MavMess.component_id(),
+                                },
+                                msg,
+                            )
+                        })
+                        .map_err(|err| err.into());
+                    } else if msg[0] == 253 && msg[1] == 9 {
+                        // slightly bizzare issue where radio is always sending hello world
+                        // info!("printing hello world");  
+                    } else {
+                        info!("false alarm, not a mavlink messaage");
+                    }
+                }
+            },
+            Err(e) => {
+                info!("error reading byte");
+                return Err(error::MessageReadError::Io);
+            }
+        }
+    }
+}
+
+/// Read a MAVLink v2  message from a Read stream.
+pub async fn read_v2_msg_shitty<M: Message>(
+    r: &mut UartRx<'static, peripherals::UART7, peripherals::DMA1_CH4>,
+) -> Result<(MavHeader, M), error::MessageReadError> {
+    loop {
+        let mut msg = [0u8; 300];
+        let n = r.read_until_idle(&mut msg).await;
+        match n {
+            Ok(v) => {
+                let new_n = n.unwrap();
+                if v == 0 {
+                    info!("no bytes read");
+                    continue;
+                } else {
+                    // info!("--------------------------------------------------------------------");
+                    // info!("Size: {}", new_n);
+                    // info!("{:?}", msg);
+                    if msg[0] == MAV_STX_V2 {
+                        let mut MavMess = MAVLinkV2MessageRaw::new();
+                        
+                        MavMess.0[0] = MAV_STX_V2;
+                        // fill header with bytes 1...len(header)
+                        MavMess.mut_header().copy_from_slice(&msg[1..=MAVLinkV2MessageRaw::HEADER_SIZE]);
+
+                        let payload_length = MavMess.payload_length() as usize;
+                        // fill payload with bytes len(header)+1...len(header)+1+payload_length
+                        let signature_size = if (MavMess.incompatibility_flags() & MAVLINK_IFLAG_SIGNED) == 0 {
+                            0
+                        } else {
+                            MAVLinkV2MessageRaw::SIGNATURE_SIZE
+                        };
+                        MavMess.mut_payload_and_checksum_and_sign().copy_from_slice(&msg[(1 + MAVLinkV2MessageRaw::HEADER_SIZE)..(1 + MAVLinkV2MessageRaw::HEADER_SIZE + payload_length + signature_size + 2)]);
+
+                        // info!("MavMess: {:?}", MavMess.0);
+                        if !MavMess.has_valid_crc::<M>() {
+                            info!("Invalid crc");
+                            continue;
+                        }
+                        return M::parse(
+                            MavlinkVersion::V2,
+                            MavMess.message_id(),
+                            MavMess.payload(),
+                        )
+                        .map(|msg| {
+                            (
+                                MavHeader {
+                                    sequence: MavMess.sequence(),
+                                    system_id: MavMess.system_id(),
+                                    component_id: MavMess.component_id(),
+                                },
+                                msg,
+                            )
+                        })
+                        .map_err(|err| err.into());
+                    } else if msg[0] == 253 && msg[1] == 9 {
+                        // slightly bizzare issue where radio is always sending hello world
+                        // info!("printing hello world");  
+                    } else {
+                        info!("false alarm, not a mavlink messaage");
+                    }
+                }
+            },
+            Err(e) => {
+                info!("error reading byte");
+                return Err(error::MessageReadError::Io);
+            }
+        }
+    }
+}
+
+
+/// Read a MAVLink v1  message from a Read stream.
+pub async fn read_v1_msg_async<M: Message, R: ReadEmbassyAsync>(
+    r: &mut R,
+) -> Result<(MavHeader, M), error::MessageReadError> {
+    loop {
+        let message = read_v1_raw_message_async(r).await?;
+        if !message.has_valid_crc::<M>() {
+            info!("Invalid crc");
+            continue;
+        }
+        return M::parse(
+            MavlinkVersion::V1,
+            u32::from(message.message_id()),
+            message.payload(),
+        )
+        .map(|msg| {
+            (
+                MavHeader {
+                    sequence: message.sequence(),
+                    system_id: message.system_id(),
+                    component_id: message.component_id(),
+                },
+                msg,
+            )
+        })
+        .map_err(|err| err.into());
+    }
+}
+
 /// Read a MAVLink v1  message from a Read stream.
 pub fn read_v1_msg<M: Message, R: Read>(
     r: &mut R,
@@ -394,6 +596,8 @@ pub fn read_v1_msg<M: Message, R: Read>(
         if !message.has_valid_crc::<M>() {
             continue;
         }
+
+        info!("found a valid crc");
 
         return M::parse(
             MavlinkVersion::V1,
@@ -589,11 +793,14 @@ pub fn read_v2_raw_message<R: Read>(
     reader: &mut R,
 ) -> Result<MAVLinkV2MessageRaw, error::MessageReadError> {
     loop {
+        // this runs every second basically
         // search for the magic framing value indicating start of mavlink message
         if reader.read_u8()? == MAV_STX_V2 {
             break;
         }
     }
+
+    info!("received first byte of mavlink message");
 
     let mut message = MAVLinkV2MessageRaw::new();
 
@@ -601,8 +808,11 @@ pub fn read_v2_raw_message<R: Read>(
     reader.read_exact(message.mut_header())?;
     reader.read_exact(message.mut_payload_and_checksum_and_sign())?;
 
+    info!("received full mavlink message");
     Ok(message)
 }
+
+
 
 /// Read a MAVLink v2  message from a Read stream.
 pub fn read_v2_msg<M: Message, R: Read>(
@@ -611,6 +821,7 @@ pub fn read_v2_msg<M: Message, R: Read>(
     loop {
         let message = read_v2_raw_message(read)?;
         if !message.has_valid_crc::<M>() {
+            info!("incorrect crc");
             // bad crc: ignore message
             continue;
         }
@@ -629,6 +840,7 @@ pub fn read_v2_msg<M: Message, R: Read>(
             .map_err(|err| err.into());
     }
 }
+
 
 /// Write a message using the given mavlink version
 pub fn write_versioned_msg<M: Message, W: Write>(
@@ -657,6 +869,27 @@ pub fn write_v2_msg<M: Message, W: Write>(
 
     w.write_all(&message_raw.0[..len])?;
 
+    Ok(len)
+}
+
+use core::convert::{TryFrom, TryInto};
+
+/// Write a MAVLink v2 message to a Write stream.
+pub fn write_v2_msg_embassy_hal<M: Message, W: WriteEmbassyAsync>(
+    w: &mut W,
+    header: MavHeader,
+    data: &M,
+) -> Result<usize, error::MessageWriteError> {
+    let mut message_raw = MAVLinkV2MessageRaw::new();
+    message_raw.serialize_message(header, data);
+
+    let payload_length: usize = message_raw.payload_length().into();
+    let len = 1 + MAVLinkV2MessageRaw::HEADER_SIZE + payload_length + 2;
+
+    // info!("payload length: {}", payload_length);
+    // info!("len: {}", len); // the length is usually around 20 bits
+
+    w.blocking_write(&message_raw.0[..len]);
     Ok(len)
 }
 
